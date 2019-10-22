@@ -5,6 +5,7 @@
 #include <Shlwapi.h>
 #include <ShlObj.h>
 #include <iostream>
+#include <string>
 
 
 namespace PrivilegeTest {
@@ -140,11 +141,16 @@ namespace PrivilegeTest {
         return(bResult);
     }
 
-    BOOL IsRunasAdmin(HANDLE hProcess) {
+    BOOL IsRunasAdmin(DWORD ProcessId) {
         BOOL bElevated = FALSE;
         HANDLE hToken = NULL;
 
         //CString strTip;
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, ProcessId);
+        if (hProcess == NULL) {
+            printf("hProcess 不存在");
+            return false;
+        }
 
         // Get target process token
         if (!OpenProcessToken(hProcess/*GetCurrentProcess()*/, TOKEN_QUERY, &hToken)) {
@@ -172,7 +178,14 @@ namespace PrivilegeTest {
     }
 }
 
-int main() {
+int main(int argc, char *argv[]) {
+    
+    if (argc == 2)
+    {
+        int pid = std::stoi(argv[1]);
+        std::cout << "pid : "<< pid <<" IsRunasAdmin : " << PrivilegeTest::IsRunasAdmin(pid) << std::endl;
+        return 0;
+    }
     std::cout << "IsUserAdmin : " << PrivilegeTest::IsUserAdmin() << std::endl;
     std::cout << "IsRunasAdmin : " << PrivilegeTest::IsRunasAdmin() << std::endl;
 
@@ -214,9 +227,9 @@ int main() {
 //Test 结果
 /*
 win7 管理员用户直接执行           0010   
-win7 管理员用户uac提权后执行           1111
+win7 管理员用户uac提权后执行      1111
 win7 标准用户直接执行             0000
-win7 标准用户uac提权后执行             1101
+win7 标准用户uac提权后执行        1101
 winxp 直接运行                   1001
-winxp -runas直接运行                   1001
+winxp -runas直接运行             1001
 */
