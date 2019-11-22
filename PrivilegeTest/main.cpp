@@ -6,6 +6,8 @@
 #include <ShlObj.h>
 #include <iostream>
 #include <string>
+#pragma comment(lib, "netapi32.lib")
+#include <LM.h>
 
 
 namespace PrivilegeTest {
@@ -178,47 +180,177 @@ namespace PrivilegeTest {
     }
 }
 
-int main(int argc, char *argv[]) {
-    
-    if (argc == 2)
-    {
-        int pid = std::stoi(argv[1]);
-        std::cout << "pid : "<< pid <<" IsRunasAdmin : " << PrivilegeTest::IsRunasAdmin(pid) << std::endl;
-        return 0;
+#include <atlsecurity.h>
+
+// Returns a token with TOKEN_ALL_ACCESS rights. At the moment, we only require
+// TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, but requirements may change in the
+// future.
+HRESULT GetCallerToken(CAccessToken* token) {
+
+    CComPtr<IUnknown> security_context;
+    HRESULT hr = ::CoGetCallContext(IID_PPV_ARGS(&security_context));
+    if (SUCCEEDED(hr)) {
+        return token->OpenCOMClientToken(TOKEN_ALL_ACCESS) ? S_OK :
+            HRESULT();
     }
-    std::cout << "IsUserAdmin : " << PrivilegeTest::IsUserAdmin() << std::endl;
-    std::cout << "IsRunasAdmin : " << PrivilegeTest::IsRunasAdmin() << std::endl;
+    else if (hr != RPC_E_CALL_COMPLETE) {
+        return hr;
+    }
 
-    TOKEN_ELEVATION_TYPE token_elevation_type = PrivilegeTest::GetProcessTokenElevationTypeStaus(GetCurrentProcessId());
-    BOOL isAdmin = FALSE;
-    PrivilegeTest::GetProcessElevation(&token_elevation_type, &isAdmin);
+    // RPC_E_CALL_COMPLETE indicates an in-proc intra-apartment call. Return the
+    // current process token.
+    return token->OpenThreadToken(TOKEN_ALL_ACCESS) ? S_OK :
+        HRESULT();
+}
 
-    std::cout << "GetProcessElevation : " << isAdmin << std::endl;
-    std::cout << "IsUserAnAdmin : " << ::IsUserAnAdmin() << std::endl;
+static bool BelongsToGroup(HANDLE token, int group_id) {
+    SID_IDENTIFIER_AUTHORITY nt_authority = SECURITY_NT_AUTHORITY;
+    PSID group = NULL;
 
-    if (!::IsUserAnAdmin())
-    {
-        auto RunAsAdministrator = [](LPCTSTR strCommand, LPCTSTR strArgs, bool bWaitProcess) {
-            SHELLEXECUTEINFO execinfo;
-            memset(&execinfo, 0, sizeof(execinfo));
-            execinfo.lpFile = strCommand;
-            execinfo.cbSize = sizeof(execinfo);
-            execinfo.lpVerb = L"runas";
-            execinfo.fMask = SEE_MASK_NOCLOSEPROCESS;
-            execinfo.nShow = SW_SHOWDEFAULT;
-            execinfo.lpParameters = strArgs;
+    BOOL check = ::AllocateAndInitializeSid(&nt_authority,
+        2,
+        SECURITY_BUILTIN_DOMAIN_RID,
+        group_id,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        &group);
+    if (check) {
+        if (!::CheckTokenMembership(token, group, &check)) {
+            check = false;
+        }
+        ::FreeSid(group);
+    }
+    return !!check;
+}
 
-            ShellExecuteEx(&execinfo);
+//determine a account is AdministratorsUser, not process Token
+bool IsAdministratorsUser() {
+    LPLOCALGROUP_USERS_INFO_0 pBuf = NULL;
+    DWORD dwLevel = 0;
+    DWORD dwFlags = LG_INCLUDE_INDIRECT;
+    DWORD dwPrefMaxLen = MAX_PREFERRED_LENGTH;
+    DWORD dwEntriesRead = 0;
+    DWORD dwTotalEntries = 0;
+    NET_API_STATUS nStatus;
 
-            if (bWaitProcess) {
-                WaitForSingleObject(execinfo.hProcess, INFINITE);
+    DWORD dwNameLen = 255;
+    wchar_t szBuffer[255];
+    memset(szBuffer, 0, sizeof(szBuffer));
+    GetUserName(szBuffer, &dwNameLen);
+
+    nStatus = NetUserGetLocalGroups(NULL,
+        szBuffer,
+        dwLevel,
+        dwFlags,
+        (LPBYTE *)&pBuf,
+        dwPrefMaxLen,
+        &dwEntriesRead,
+        &dwTotalEntries);
+
+    bool isAdminUser = false;
+    if (nStatus == NERR_Success) {
+        LPLOCALGROUP_USERS_INFO_0 pTmpBuf;
+        DWORD i;
+        DWORD dwTotalCount = 0;
+
+        if ((pTmpBuf = pBuf) != NULL) {
+            fprintf(stderr, "\nLocal group(s):\n");
+
+            for (i = 0; i < dwEntriesRead; i++) {
+                if (pTmpBuf == NULL) {
+                    fprintf(stderr, "An access violation has occurred\n");
+                    break;
+                }
+                if (0 == StrCmpIW(pTmpBuf->lgrui0_name, L"Administrators")) {
+                    isAdminUser = true;
+                }
+                wprintf(L"\t-- %s\n", pTmpBuf->lgrui0_name);
+                pTmpBuf++;
+                dwTotalCount++;
             }
-        };
-        wchar_t szFilePath[MAX_PATH + 1] = { 0 };
-        GetModuleFileName(NULL, szFilePath, MAX_PATH);
-        std::wcout << szFilePath << std::endl;
-        RunAsAdministrator(szFilePath, L"", false);
+        }
+        //
+        // If all available entries were
+        //  not enumerated, print the number actually 
+        //  enumerated and the total number available.
+        //
+        if (dwEntriesRead < dwTotalEntries)
+            fprintf(stderr, "\nTotal entries: %d", dwTotalEntries);
+        //
+        // Otherwise, just print the total.
+        //
+        printf("\nEntries enumerated: %d\n", dwTotalCount);
     }
+    else
+        fprintf(stderr, "A system error has occurred: %d\n", nStatus);
+    //
+    // Free the allocated memory.
+    //
+    if (pBuf != NULL)
+        NetApiBufferFree(pBuf);
+    return isAdminUser;
+}
+
+void test1() {}
+
+bool test2() {
+    HANDLE hToken = NULL;
+    CAccessToken impersonated_token;
+    if (FAILED(GetCallerToken(&impersonated_token))) {
+        return false;
+    }
+    std::cout << "DOMAIN_ALIAS_RID_ADMINS:" << BelongsToGroup(impersonated_token.GetHandle(), DOMAIN_ALIAS_RID_ADMINS) << std::endl;
+    std::cout << "DOMAIN_ALIAS_RID_USERS:" << BelongsToGroup(impersonated_token.GetHandle(), DOMAIN_ALIAS_RID_USERS) << std::endl;
+}
+void test3() {
+    std::cout << "user is administators:" << IsAdministratorsUser() << std::endl;
+}
+
+int main(int argc, char *argv[]) {
+ 
+    //if (argc == 2)
+    //{
+    //    int pid = std::stoi(argv[1]);
+    //    std::cout << "pid : "<< pid <<" IsRunasAdmin : " << PrivilegeTest::IsRunasAdmin(pid) << std::endl;
+    //    return 0;
+    //}
+    //std::cout << "IsUserAdmin : " << PrivilegeTest::IsUserAdmin() << std::endl;
+    //std::cout << "IsRunasAdmin : " << PrivilegeTest::IsRunasAdmin() << std::endl;
+
+    //TOKEN_ELEVATION_TYPE token_elevation_type = PrivilegeTest::GetProcessTokenElevationTypeStaus(GetCurrentProcessId());
+    //BOOL isAdmin = FALSE;
+    //PrivilegeTest::GetProcessElevation(&token_elevation_type, &isAdmin);
+
+    //std::cout << "GetProcessElevation : " << isAdmin << std::endl;
+    //std::cout << "IsUserAnAdmin : " << ::IsUserAnAdmin() << std::endl;
+    ////std::cout << "IsUserAnAdmin : " << !::IsUserAnAdmin() << std::endl;
+
+    //  if (!::IsUserAnAdmin()) {
+    //      auto RunAsAdministrator = [](LPCTSTR strCommand, LPCTSTR strArgs, bool bWaitProcess) {
+    //          SHELLEXECUTEINFO execinfo;
+    //          memset(&execinfo, 0, sizeof(execinfo));
+    //          execinfo.lpFile = strCommand;
+    //          execinfo.cbSize = sizeof(execinfo);
+    //          execinfo.lpVerb = L"runas";
+    //          execinfo.fMask = SEE_MASK_NOCLOSEPROCESS;
+    //          execinfo.nShow = SW_SHOWDEFAULT;
+    //          execinfo.lpParameters = strArgs;
+
+    //          ShellExecuteEx(&execinfo);
+
+    //          if (bWaitProcess) {
+    //              WaitForSingleObject(execinfo.hProcess, INFINITE);
+    //          }
+    //      };
+    //      wchar_t szFilePath[MAX_PATH + 1] = { 0 };
+    //      GetModuleFileName(NULL, szFilePath, MAX_PATH);
+    //      std::wcout << szFilePath << std::endl;
+    //      RunAsAdministrator(szFilePath, L"", false);
+    //  }
 
     system("pause");
     return 0;
@@ -229,7 +361,7 @@ int main(int argc, char *argv[]) {
 win7 管理员用户直接执行           0010   
 win7 管理员用户uac提权后执行      1111
 win7 标准用户直接执行             0000
-win7 标准用户uac提权后执行        1101
+win7 标准用户uac提权后执行        1111
 winxp 直接运行                   1001
 winxp -runas直接运行             1001
 */
